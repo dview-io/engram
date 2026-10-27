@@ -1,0 +1,39 @@
+[package]
+name = "engram_dview"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = true
+description = "Graded text-to-SQL memory: retrieve verified reuse, few-shot SQL examples, or a miss; record and decay ask/repair patterns."
+license = "Apache-2.0"
+repository = "https://github.com/dview-io/engram"
+readme = "README.md"
+keywords = ["memory", "llm", "text-to-SQL", "sql", "retrieval"]
+categories = ["database", "science"]
+
+[features]
+default = []
+# Deterministic FakeEmbedder for host / integration tests.
+test-utils = []
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sqlparser = { version = "0.63", features = ["visitor"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# Enable `test-utils` for integration tests so plain `cargo test` runs them.
+engram_dview = { path = ".", features = ["test-utils"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
