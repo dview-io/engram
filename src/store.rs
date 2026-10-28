@@ -4,7 +4,9 @@ use async_trait::async_trait;
 
 use crate::error::{Error, Result};
 use crate::policy::Policy;
-use crate::types::{now_ms, AskRecord, DecayReason, RecordId, RepairRecord, Scope, TableRef, Vote};
+use crate::types::{
+    now_ms, AskRecord, DecayReason, KpiRef, RecordId, RepairRecord, Scope, TableRef, Vote,
+};
 
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
@@ -12,13 +14,29 @@ pub trait MemoryStore: Send + Sync {
     async fn get_ask(&self, scope: &Scope, id: &RecordId) -> Result<Option<AskRecord>>;
     async fn get_ask_by_eval(&self, scope: &Scope, eval_id: &str) -> Result<Option<AskRecord>>;
     async fn list_eligible_asks(&self, scope: &Scope) -> Result<Vec<AskRecord>>;
-    async fn save_ask(&self, record: AskRecord) -> Result<()>;
+
+    /// Whether any eligible ask exists for `scope` (for EmptyStore vs filtered miss).
+    async fn has_eligible_asks(&self, scope: &Scope) -> Result<bool> {
+        Ok(!self.list_eligible_asks(scope).await?.is_empty())
+    }
+
+    /// Eligible asks nearest to `embedding`, optionally restricted to tables/KPIs.
+    /// Postgres does an exact scan within `scope` (no ANN) so tenant filters are correct.
+    async fn list_eligible_asks_near(
+        &self,
+        scope: &Scope,
+        _embedding: &[f32],
+        _limit: usize,
+        _tables: Option<&[TableRef]>,
+        _kpis: Option<&[KpiRef]>,
+    ) -> Result<Vec<AskRecord>> {
+        self.list_eligible_asks(scope).await
+    }
 
     /// Atomic: `uses += 1`.
     async fn bump_uses(&self, scope: &Scope, id: &RecordId) -> Result<()>;
     /// Atomic: `successes += 1`.
     async fn bump_successes(&self, scope: &Scope, id: &RecordId) -> Result<()>;
-    /// Atomic trust update for a decay reason (does not conflate feedback with failed reuse).
     async fn apply_decay(
         &self,
         scope: &Scope,
@@ -26,7 +44,6 @@ pub trait MemoryStore: Send + Sync {
         reason: DecayReason,
         policy: &Policy,
     ) -> Result<()>;
-    /// Atomic thumbs up / down.
     async fn apply_vote(
         &self,
         scope: &Scope,
@@ -41,7 +58,6 @@ pub trait MemoryStore: Send + Sync {
         scope: &Scope,
         error_class: &str,
     ) -> Result<Vec<RepairRecord>>;
-    async fn save_repair(&self, record: RepairRecord) -> Result<()>;
 
     async fn invalidate_table(&self, scope: &Scope, table: &TableRef) -> Result<u64>;
 }
@@ -83,6 +99,22 @@ fn find_ask_mut<'a>(
         .ok_or_else(|| Error::NotFound(format!("ask {}", id.as_uuid())))
 }
 
+fn same_sorted_strs(a: &[String], b: &[String]) -> bool {
+    a == b
+}
+
+fn sorted_tables(tables: &[TableRef]) -> Vec<String> {
+    let mut v: Vec<String> = tables.iter().map(|t| t.as_str().to_string()).collect();
+    v.sort_unstable();
+    v
+}
+
+fn sorted_kpis(kpis: &[KpiRef]) -> Vec<String> {
+    let mut v: Vec<String> = kpis.iter().map(|k| k.as_str().to_string()).collect();
+    v.sort_unstable();
+    v
+}
+
 #[async_trait]
 impl MemoryStore for InMemoryStore {
     async fn upsert_ask(&self, record: AskRecord) -> Result<(RecordId, bool)> {
@@ -90,7 +122,6 @@ impl MemoryStore for InMemoryStore {
         if let Some(existing) =
             g.asks.iter_mut().find(|a| a.scope == record.scope && a.eval_id == record.eval_id)
         {
-            // Content merge only — preserve trust / eligibility / counters / id.
             let id = existing.id.clone();
             existing.conversation_id = record.conversation_id;
             existing.question = record.question;
@@ -128,13 +159,25 @@ impl MemoryStore for InMemoryStore {
         Ok(g.asks.iter().filter(|a| &a.scope == scope && a.eligible).cloned().collect())
     }
 
-    async fn save_ask(&self, record: AskRecord) -> Result<()> {
-        let mut g = self.inner.lock().map_err(|_| lock_err())?;
-        if let Some(slot) = g.asks.iter_mut().find(|a| a.id == record.id) {
-            *slot = record;
-            return Ok(());
+    async fn list_eligible_asks_near(
+        &self,
+        scope: &Scope,
+        _embedding: &[f32],
+        limit: usize,
+        tables: Option<&[TableRef]>,
+        kpis: Option<&[KpiRef]>,
+    ) -> Result<Vec<AskRecord>> {
+        let mut rows = self.list_eligible_asks(scope).await?;
+        if let Some(t) = tables {
+            let want = sorted_tables(t);
+            rows.retain(|r| same_sorted_strs(&sorted_tables(&r.tables), &want));
         }
-        Err(Error::NotFound(format!("ask {}", record.id.as_uuid())))
+        if let Some(k) = kpis {
+            let want = sorted_kpis(k);
+            rows.retain(|r| same_sorted_strs(&sorted_kpis(&r.kpis), &want));
+        }
+        rows.truncate(limit.max(1));
+        Ok(rows)
     }
 
     async fn bump_uses(&self, scope: &Scope, id: &RecordId) -> Result<()> {
@@ -216,7 +259,7 @@ impl MemoryStore for InMemoryStore {
             r.scope == record.scope
                 && r.error_class == record.error_class
                 && r.schema_fingerprint == record.schema_fingerprint
-                && same_tables(&r.table_ids, &record.table_ids)
+                && same_sorted_strs(&sorted_tables(&r.table_ids), &sorted_tables(&record.table_ids))
         }) {
             let id = existing.id.clone();
             let fixed_changed = existing.fixed_sql_fragment != record.fixed_sql_fragment;
@@ -226,7 +269,6 @@ impl MemoryStore for InMemoryStore {
             if fixed_changed {
                 existing.times_fixed = existing.times_fixed.saturating_add(1);
             }
-            // Do not re-enable an invalidated repair.
             existing.updated_at = now_ms();
             return Ok((id, false));
         }
@@ -246,15 +288,6 @@ impl MemoryStore for InMemoryStore {
             .filter(|r| &r.scope == scope && r.eligible && r.error_class == error_class)
             .cloned()
             .collect())
-    }
-
-    async fn save_repair(&self, record: RepairRecord) -> Result<()> {
-        let mut g = self.inner.lock().map_err(|_| lock_err())?;
-        if let Some(slot) = g.repairs.iter_mut().find(|r| r.id == record.id) {
-            *slot = record;
-            return Ok(());
-        }
-        Err(Error::NotFound(format!("repair {}", record.id.as_uuid())))
     }
 
     async fn invalidate_table(&self, scope: &Scope, table: &TableRef) -> Result<u64> {
@@ -281,15 +314,4 @@ impl MemoryStore for InMemoryStore {
         }
         Ok(n)
     }
-}
-
-fn same_tables(a: &[TableRef], b: &[TableRef]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut left: Vec<&str> = a.iter().map(TableRef::as_str).collect();
-    let mut right: Vec<&str> = b.iter().map(TableRef::as_str).collect();
-    left.sort_unstable();
-    right.sort_unstable();
-    left == right
 }

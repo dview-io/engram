@@ -15,6 +15,8 @@ categories = ["database", "science"]
 default = []
 # Deterministic FakeEmbedder for host / integration tests.
 test-utils = []
+# Postgres + pgvector MemoryStore (host injects PgPool).
+postgres = ["dep:sqlx"]
 
 [dependencies]
 async-trait = "0.1"
@@ -23,10 +25,18 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sqlparser = { version = "0.63", features = ["visitor"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring-webpki",
+    "postgres",
+    "uuid",
+    "json",
+], optional = true }
 
 [dev-dependencies]
-# Enable `test-utils` for integration tests so plain `cargo test` runs them.
-engram_dview = { path = ".", features = ["test-utils"] }
+# Enable features so plain `cargo test` builds postgres + FakeEmbedder.
+dotenvy = "0.15"
+engram_dview = { path = ".", features = ["test-utils", "postgres"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [lints.rust]

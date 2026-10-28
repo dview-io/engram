@@ -18,4 +18,8 @@ pub enum Error {
 
     #[error("record not found: {0}")]
     NotFound(String),
+
+    /// pgvector extension missing or unusable — host should disable engram and keep eval.
+    #[error("pgvector unavailable: {0}")]
+    VectorUnavailable(String),
 }

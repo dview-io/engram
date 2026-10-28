@@ -14,21 +14,41 @@ It also stores graded ask records and SQL repair hints, and decays records after
 
 ```toml
 engram_dview = "0.1"
-# optional: FakeEmbedder for out-of-tree tests
-# engram_dview = { version = "0.1", features = ["test-utils"] }
+# optional features:
+# engram_dview = { version = "0.1", features = ["postgres", "test-utils"] }
 ```
 
 ```rust
 use engram_dview::Memory;
 ```
 
-The host injects an `Embedder` and a `MemoryStore` (Phase 1 ships an in-memory store; Postgres arrives in Phase 2). Ask records are unique on `(scope, eval_id)`.
+The host injects an `Embedder` and a `MemoryStore`. Ask records are unique on `(scope, eval_id)`.
+
+- **In-memory** store: always available (unit tests).
+- **Postgres + pgvector** (`feature = "postgres"`): `PostgresStore`. Host supplies `sqlx::PgPool`.
+  - Reconcile specs: `ask_table_def` / `repair_table_def` / `EngramSchemaSpec` (JSONB columns, `vector(N)`, no HNSW in v1).
+  - `apply_schema` is a **test / standalone** helper with an advisory lock — production install is host reconcile.
+
+## Postgres integration tests
+
+1. Set in `.env` (gitignored):
+
+```bash
+ENGRAM_DATABASE_URL=postgres://root:<password>@localhost:5432/<db_name>
+# or: ENGRAM_DATABASE_URL=postgresql+psycopg2://root:<password>@localhost:5432/<db_name>
+```
+
+2. Ensure the DB can use the `vector` extension.
+
+3. Run:
 
 ```bash
 cargo test
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+# optional: fail instead of skip when URL missing
+ENGRAM_REQUIRE_DB=1 cargo test --test phase2_postgres
 ```
+
+Each Phase 2 test uses an isolated `engram_test_<uuid>` schema and drops it afterward.
 
 ## License
 

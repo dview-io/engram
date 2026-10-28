@@ -12,6 +12,8 @@ pub struct Policy {
     pub few_shot_similarity_min: f32,
     pub verified_reuse_similarity_min: f32,
     pub few_shot_limit: usize,
+    /// Max eligible rows fetched from the store for ranking (pgvector nearest-N).
+    pub candidate_fetch_limit: usize,
     pub max_strikes: u32,
     /// Thumbs-down count that marks an ask ineligible.
     pub max_thumbs_down: u32,
@@ -27,6 +29,7 @@ impl Default for Policy {
             few_shot_similarity_min: 0.75,
             verified_reuse_similarity_min: 0.92,
             few_shot_limit: 3,
+            candidate_fetch_limit: 64,
             max_strikes: 2,
             max_thumbs_down: 2,
             verified_reuse_enabled: true,

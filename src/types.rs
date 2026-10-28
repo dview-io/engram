@@ -136,6 +136,27 @@ pub enum PathTaken {
     Expert,
 }
 
+impl PathTaken {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::FewShot => "few_shot",
+            Self::VerifiedReuse => "verified_reuse",
+            Self::Expert => "expert",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cold" => Some(Self::Cold),
+            "few_shot" => Some(Self::FewShot),
+            "verified_reuse" => Some(Self::VerifiedReuse),
+            "expert" => Some(Self::Expert),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum DecayReason {

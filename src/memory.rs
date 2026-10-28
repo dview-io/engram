@@ -44,20 +44,32 @@ where
             }
         };
 
-        let candidates = self.store.list_eligible_asks(scope).await?;
-        if candidates.is_empty() {
+        if !self.store.has_eligible_asks(scope).await? {
             return Ok(Outcome::Miss { reason: MissReason::EmptyStore });
         }
 
-        let mut hard_passed = 0_usize;
+        // Push table/KPI filters into the store so LIMIT isn't wasted on other tables.
+        let candidates = self
+            .store
+            .list_eligible_asks_near(
+                scope,
+                &embedding,
+                self.policy.candidate_fetch_limit,
+                Some(&ask.tables),
+                Some(&ask.kpis),
+            )
+            .await?;
+        if candidates.is_empty() {
+            return Ok(Outcome::Miss { reason: MissReason::HardFilter });
+        }
+
         let mut ranked = Vec::new();
         for record in candidates {
+            // Store already filtered tables/KPIs; keep hard_filter as a safety net.
             if !hard_filter(ask, &record) {
                 continue;
             }
-            hard_passed = hard_passed.saturating_add(1);
             let Ok(similarity) = score_similarity(&embedding, &record) else {
-                // Skip records with incompatible embeddings (e.g. model change).
                 continue;
             };
             if similarity < self.policy.few_shot_similarity_min {
@@ -67,9 +79,6 @@ where
         }
 
         if ranked.is_empty() {
-            if hard_passed == 0 {
-                return Ok(Outcome::Miss { reason: MissReason::HardFilter });
-            }
             return Ok(Outcome::Miss { reason: MissReason::BelowSimilarity });
         }
 
@@ -103,34 +112,17 @@ where
         }
 
         let sql_has_absolute_dates = sql_has_absolute_dates(&ask.sql);
-
-        if let Some(existing) = self.store.get_ask_by_eval(scope, &ask.eval_id).await? {
-            // Preserve trust; refresh content. Re-embed only when the question changes.
-            let embedding = if existing.question == ask.question {
-                existing.embedding.clone()
+        // Re-embed only when the question changed; trust is preserved by store upsert.
+        let embedding =
+            if let Some(existing) = self.store.get_ask_by_eval(scope, &ask.eval_id).await? {
+                if existing.question == ask.question {
+                    existing.embedding
+                } else {
+                    self.embedder.embed(&ask.question).await?
+                }
             } else {
                 self.embedder.embed(&ask.question).await?
             };
-            let mut updated = existing;
-            updated.conversation_id = ask.conversation_id;
-            updated.question = ask.question;
-            updated.embedding = embedding;
-            updated.tables = ask.tables;
-            updated.kpis = ask.kpis;
-            updated.ask_signature = ask.ask_signature;
-            updated.schema_fingerprints = ask.schema_fingerprints;
-            updated.sql = ask.sql;
-            updated.sql_has_absolute_dates = sql_has_absolute_dates;
-            updated.pandas = ask.pandas;
-            updated.scores = ask.scores;
-            updated.path_taken = ask.path_taken;
-            updated.expert = ask.expert;
-            updated.updated_at = now_ms();
-            let (id, created) = self.store.upsert_ask(updated).await?;
-            return Ok(RecordAskResult::Stored(Recorded { id, created }));
-        }
-
-        let embedding = self.embedder.embed(&ask.question).await?;
         let ts = now_ms();
         let record = AskRecord {
             id: RecordId::new(),
