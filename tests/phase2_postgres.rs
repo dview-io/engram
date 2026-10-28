@@ -1,8 +1,9 @@
 //! Phase 2 Postgres + pgvector integration tests.
 //!
 //! Requires `ENGRAM_DATABASE_URL` (sqlx form or `postgresql+psycopg2://…`).
-//! Each test uses an isolated schema `engram_test_<uuid>` and drops it afterward.
-//! Set `ENGRAM_REQUIRE_DB=1` to fail (not skip) when the URL is missing.
+//! Reuses a single schema (`engram_test`, or `ENGRAM_TEST_SCHEMA`) — created only if missing —
+//! and truncates tables between tests. Set `ENGRAM_REQUIRE_DB=1` to fail (not skip) when the
+//! URL is missing. Optional `ENGRAM_TEST_DROP_SCHEMA=1` drops the schema after each test.
 
 #![allow(
     clippy::unwrap_used,
@@ -12,16 +13,15 @@
     clippy::field_reassign_with_default
 )]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use engram_dview::{
     apply_schema, AskQuery, AskSignature, DecayReason, Embedder, ErrorQuery, FakeEmbedder,
     GradedAsk, KpiRef, Memory, MemoryStore, MissReason, Outcome, PathTaken, Policy, PostgresStore,
-    RecordAskResult, RepairInput, SchemaFingerprint, Scope, Scores, TableRef, Vote,
-    DEFAULT_EMBEDDING_DIM,
+    RecordAskResult, RepairInput, SchemaFingerprint, Scope, Scores, TableRef, Vote, ASK_TABLE,
+    DEFAULT_EMBEDDING_DIM, REPAIR_TABLE, TRUST_TABLE,
 };
 use sqlx::PgPool;
-use uuid::Uuid;
 
 fn load_env() {
     let _ = dotenvy::dotenv();
@@ -64,13 +64,94 @@ fn embedding_dim() -> usize {
         .unwrap_or(DEFAULT_EMBEDDING_DIM)
 }
 
+fn test_schema_name() -> String {
+    load_env();
+    std::env::var("ENGRAM_TEST_SCHEMA")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "engram_test".to_string())
+}
+
+fn drop_schema_after_test() -> bool {
+    load_env();
+    matches!(
+        std::env::var("ENGRAM_TEST_DROP_SCHEMA").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Serializes Phase 2 tests that share one schema (truncate is not parallel-safe).
+fn test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+async fn schema_exists(pool: &PgPool, schema: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+        .bind(schema)
+        .fetch_one(pool)
+        .await
+        .expect("check schema exists")
+}
+
+/// Current layout: JSONB `tables` / `table_ids` and the trust-events table.
+async fn schema_is_current(pool: &PgPool, schema: &str) -> bool {
+    let has_trust: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = $1 AND table_name = $2
+         )",
+    )
+    .bind(schema)
+    .bind(TRUST_TABLE)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    let tables_is_jsonb: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = $2
+              AND column_name = 'tables' AND udt_name = 'jsonb'
+         )",
+    )
+    .bind(schema)
+    .bind(ASK_TABLE)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    has_trust && tables_is_jsonb
+}
+
+async fn drop_schema(pool: &PgPool, schema: &str) {
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(pool)
+        .await
+        .expect("drop stale engram test schema");
+}
+
+async fn truncate_engram_tables(pool: &PgPool, schema: &str) {
+    let sql = format!(
+        "TRUNCATE TABLE {schema}.{ASK_TABLE}, {schema}.{REPAIR_TABLE}, {schema}.{TRUST_TABLE} \
+         RESTART IDENTITY CASCADE"
+    );
+    sqlx::query(&sql).execute(pool).await.expect("truncate engram tables");
+}
+
 struct TestDb {
     pool: PgPool,
     schema: String,
+    /// Held for the whole test so parallel `--test-threads` N cannot interleave truncates.
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl TestDb {
     async fn setup() -> Option<Self> {
+        let _lock = test_lock();
         let Some(url) = database_url() else {
             if require_db() {
                 panic!("ENGRAM_REQUIRE_DB=1 but ENGRAM_DATABASE_URL is unset");
@@ -93,14 +174,34 @@ impl TestDb {
             return None;
         }
 
-        let schema = format!("engram_test_{}", Uuid::new_v4().simple());
+        let schema = test_schema_name();
         assert!(
             schema.starts_with("engram_test"),
-            "refusing to touch schema that does not start with engram_test"
+            "refusing to touch schema `{schema}` (must start with engram_test)"
         );
 
-        apply_schema(&pool, &schema, embedding_dim()).await.expect("apply engram schema");
-        Some(Self { pool, schema })
+        if schema_exists(&pool, &schema).await {
+            if schema_is_current(&pool, &schema).await {
+                // Reuse — IF NOT EXISTS apply is cheap; wipe rows for isolation.
+                apply_schema(&pool, &schema, embedding_dim())
+                    .await
+                    .expect("reconcile existing engram test schema");
+                truncate_engram_tables(&pool, &schema).await;
+            } else {
+                // Old layout (e.g. TEXT[] tables) — recreate once.
+                eprintln!("engram test schema `{schema}` is outdated; recreating");
+                drop_schema(&pool, &schema).await;
+                apply_schema(&pool, &schema, embedding_dim())
+                    .await
+                    .expect("recreate engram test schema");
+            }
+        } else {
+            apply_schema(&pool, &schema, embedding_dim())
+                .await
+                .expect("create engram test schema");
+        }
+
+        Some(Self { pool, schema, _lock })
     }
 
     fn memory(&self) -> Memory<PostgresStore, FakeEmbedder> {
@@ -122,6 +223,10 @@ impl TestDb {
 
 impl Drop for TestDb {
     fn drop(&mut self) {
+        if !drop_schema_after_test() {
+            // Keep `engram_test` around for the next run / next test (data truncated at setup).
+            return;
+        }
         let schema = self.schema.clone();
         let Some(url) = database_url() else {
             return;
@@ -448,4 +553,51 @@ async fn postgres_thumbs_down_reaches_ineligible() {
     mem.feedback(&scope_a(), &recorded.id, Vote::Down).await.unwrap();
     let out = mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap();
     assert!(matches!(out, Outcome::Miss { reason: MissReason::EmptyStore }));
+}
+
+#[tokio::test]
+async fn postgres_trust_for_eval_is_atomic_and_idempotent() {
+    let Some(db) = TestDb::setup().await else {
+        return;
+    };
+    let mem = db.memory();
+    let q = "monthly revenue by region last 6 months";
+    let recorded = store_ask(&mem, graded("e1", q, "6", RELATIVE_SQL, "schema-v1")).await;
+
+    assert!(mem
+        .reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1")
+        .await
+        .unwrap());
+    assert!(!mem
+        .reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1")
+        .await
+        .unwrap());
+
+    let out = mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap();
+    match out {
+        Outcome::VerifiedReuse { record } => {
+            assert_eq!(record.uses, 1);
+            assert_eq!(record.successes, 1);
+        }
+        other => panic!("expected VerifiedReuse, got {other:?}"),
+    }
+
+    assert!(mem
+        .decay_failed_reuse_for_eval(&scope_a(), &recorded.id, "reuse-eval-2")
+        .await
+        .unwrap());
+    assert!(!mem
+        .decay_failed_reuse_for_eval(&scope_a(), &recorded.id, "reuse-eval-2")
+        .await
+        .unwrap());
+
+    let out = mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap();
+    match out {
+        Outcome::VerifiedReuse { record } => {
+            assert_eq!(record.strikes, 1);
+            assert_eq!(record.failures, 1);
+            assert_eq!(record.uses, 1);
+        }
+        other => panic!("expected VerifiedReuse after one strike, got {other:?}"),
+    }
 }

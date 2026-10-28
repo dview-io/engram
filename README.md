@@ -48,7 +48,8 @@ cargo test
 ENGRAM_REQUIRE_DB=1 cargo test --test phase2_postgres
 ```
 
-Each Phase 2 test uses an isolated `engram_test_<uuid>` schema and drops it afterward.
+Phase 2 tests reuse a single schema (`engram_test`, override with `ENGRAM_TEST_SCHEMA`): created
+only if missing, truncated between tests. Set `ENGRAM_TEST_DROP_SCHEMA=1` to drop it after each test.
 
 ## License
 

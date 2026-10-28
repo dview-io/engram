@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 
 pub const ASK_TABLE: &str = "engram_ask_records";
 pub const REPAIR_TABLE: &str = "engram_repair_records";
+pub const TRUST_TABLE: &str = "engram_trust_events";
 pub const DEFAULT_EMBEDDING_DIM: usize = 32;
 
 /// Neutral SQL type vocabulary for host translation (maps onto dlens `SqlType`).
@@ -175,6 +176,30 @@ pub fn ask_table_def(embedding_dim: u32) -> EngramTableDef {
     }
 }
 
+/// One trust update per graded eval (`(scope, eval_id)`), so reinforce/decay stay idempotent
+/// across rescored / restarted hosts.
+pub fn trust_table_def() -> EngramTableDef {
+    EngramTableDef {
+        name: TRUST_TABLE,
+        requires_vector: false,
+        primary_key: &["scope", "eval_id"],
+        columns: vec![
+            col("scope", EngramSqlType::Text, false, None),
+            col("eval_id", EngramSqlType::Text, false, None),
+            col("source_id", EngramSqlType::Uuid, false, None),
+            col("outcome", EngramSqlType::Text, false, None),
+            col("created_at", EngramSqlType::BigInt, false, None),
+        ],
+        uniques: vec![],
+        indexes: vec![EngramIndex {
+            name: "engram_trust_events_source_idx",
+            columns: &["scope", "source_id"],
+            unique: false,
+            predicate: None,
+        }],
+    }
+}
+
 /// Repair-record table definition.
 pub fn repair_table_def() -> EngramTableDef {
     EngramTableDef {
@@ -215,6 +240,7 @@ pub struct EngramSchemaSpec {
     pub embedding_dim: usize,
     pub ask: EngramTableDef,
     pub repair: EngramTableDef,
+    pub trust: EngramTableDef,
     pub required_extension: &'static str,
 }
 
@@ -232,16 +258,21 @@ impl EngramSchemaSpec {
             embedding_dim,
             ask: ask_table_def(dim),
             repair: repair_table_def(),
+            trust: trust_table_def(),
             required_extension: "vector",
         })
     }
 
     /// Table + index DDL only (extension handled separately by [`apply_schema`]).
     pub fn table_ddl(&self) -> Result<Vec<String>> {
-        let mut out =
-            vec![self.ask.to_create_sql(&self.schema)?, self.repair.to_create_sql(&self.schema)?];
+        let mut out = vec![
+            self.ask.to_create_sql(&self.schema)?,
+            self.repair.to_create_sql(&self.schema)?,
+            self.trust.to_create_sql(&self.schema)?,
+        ];
         out.extend(self.ask.index_sql(&self.schema)?);
         out.extend(self.repair.index_sql(&self.schema)?);
+        out.extend(self.trust.index_sql(&self.schema)?);
         Ok(out)
     }
 }

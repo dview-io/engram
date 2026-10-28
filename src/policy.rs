@@ -105,12 +105,33 @@ pub fn reuse_gates_pass(query: &AskQuery, record: &AskRecord) -> bool {
     if !query.signature.is_reuse_ready() || !record.ask_signature.is_reuse_ready() {
         return false;
     }
+    // Empty tables / fingerprints must not verify — signature alone is not enough.
+    if query.tables.is_empty() || record.tables.is_empty() {
+        return false;
+    }
+    if query.fingerprints.is_empty() || record.schema_fingerprints.is_empty() {
+        return false;
+    }
+    if !fingerprints_cover_tables(&query.tables, &query.fingerprints)
+        || !fingerprints_cover_tables(&record.tables, &record.schema_fingerprints)
+    {
+        return false;
+    }
     // Lifetime failed-reuse bias: more failures than successes blocks replay.
     if record.strikes > 0 && record.failures > record.successes {
         return false;
     }
     signatures_match(&query.signature, &record.ask_signature)
         && fingerprints_match(&query.fingerprints, &record.schema_fingerprints)
+}
+
+/// Every table in `tables` has a fingerprint entry.
+pub fn fingerprints_cover_tables(
+    tables: &[TableRef],
+    fingerprints: &[(TableRef, SchemaFingerprint)],
+) -> bool {
+    !tables.is_empty()
+        && tables.iter().all(|t| fingerprints.iter().any(|(ft, _)| ft == t))
 }
 
 fn signatures_match(a: &AskSignature, b: &AskSignature) -> bool {
@@ -121,6 +142,10 @@ fn fingerprints_match(
     query: &[(TableRef, SchemaFingerprint)],
     stored: &[(TableRef, SchemaFingerprint)],
 ) -> bool {
+    // Empty-empty must not count as a match (gated earlier, but keep the invariant here).
+    if query.is_empty() || stored.is_empty() {
+        return false;
+    }
     if query.len() != stored.len() {
         return false;
     }

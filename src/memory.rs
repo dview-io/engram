@@ -11,7 +11,8 @@ use crate::sql_inspect::sql_has_absolute_dates;
 use crate::store::MemoryStore;
 use crate::types::{
     now_ms, AskQuery, AskRecord, DecayReason, ErrorQuery, GradedAsk, MissReason, Outcome,
-    RecordAskResult, RecordId, Recorded, RepairInput, RepairRecord, Scope, TableRef, Vote,
+    RecordAskResult, RecordId, Recorded, RepairInput, RepairRecord, Scope, TableRef, TrustOutcome,
+    Vote,
 };
 
 pub struct Memory<S, E> {
@@ -180,6 +181,8 @@ where
     ///
     /// Failed reuse should call [`Self::decay`] with [`DecayReason::FailedReuse`] instead;
     /// `uses` counts successful uses only.
+    ///
+    /// Prefer [`Self::reinforce_for_eval`] when the bump is tied to a graded eval (idempotent).
     pub async fn reinforce(&self, scope: &Scope, id: &RecordId) -> Result<()> {
         self.store.bump_uses(scope, id).await?;
         self.store.bump_successes(scope, id).await
@@ -187,6 +190,47 @@ where
 
     pub async fn decay(&self, scope: &Scope, id: &RecordId, reason: DecayReason) -> Result<()> {
         self.store.apply_decay(scope, id, reason, &self.policy).await
+    }
+
+    /// Idempotent reinforce keyed by `(scope, eval_id)`. Returns whether counters were bumped.
+    ///
+    /// **First verdict wins:** a later rescore that would flip reinforce↔decay is ignored once
+    /// an event exists for this eval. Claim and counter updates are atomic in the store.
+    pub async fn reinforce_for_eval(
+        &self,
+        scope: &Scope,
+        source_id: &RecordId,
+        eval_id: &str,
+    ) -> Result<bool> {
+        self.store
+            .apply_trust_for_eval(
+                scope,
+                eval_id,
+                source_id,
+                TrustOutcome::Reinforce,
+                &self.policy,
+            )
+            .await
+    }
+
+    /// Idempotent failed-reuse decay keyed by `(scope, eval_id)`.
+    ///
+    /// Same first-verdict-wins rule as [`Self::reinforce_for_eval`].
+    pub async fn decay_failed_reuse_for_eval(
+        &self,
+        scope: &Scope,
+        source_id: &RecordId,
+        eval_id: &str,
+    ) -> Result<bool> {
+        self.store
+            .apply_trust_for_eval(
+                scope,
+                eval_id,
+                source_id,
+                TrustOutcome::DecayFailedReuse,
+                &self.policy,
+            )
+            .await
     }
 
     pub async fn feedback(&self, scope: &Scope, id: &RecordId, vote: Vote) -> Result<()> {

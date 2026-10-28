@@ -513,3 +513,48 @@ async fn repair_lookup_requires_matching_fingerprint() {
         .unwrap();
     assert!(miss.is_empty());
 }
+
+#[tokio::test]
+async fn empty_fingerprints_block_verified_reuse() {
+    let mem = memory(Policy::default());
+    let q = "monthly revenue by region last 6 months";
+    let mut ask = graded("e1", q, "6", RELATIVE_SQL, "schema-v1");
+    ask.schema_fingerprints = vec![];
+    store(&mem, ask).await;
+
+    let mut qy = query(q, "6", "schema-v1");
+    qy.fingerprints = vec![];
+    let out = mem.retrieve(&scope_a(), &qy).await.unwrap();
+    assert!(
+        !matches!(out, Outcome::VerifiedReuse { .. }),
+        "empty fingerprints must not verify"
+    );
+}
+
+#[tokio::test]
+async fn trust_for_eval_is_idempotent_across_repeats() {
+    let mem = memory(Policy::default());
+    let q = "monthly revenue by region last 6 months";
+    let recorded = store(&mem, graded("e1", q, "6", RELATIVE_SQL, "schema-v1")).await;
+
+    assert!(mem.reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1").await.unwrap());
+    assert!(!mem.reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1").await.unwrap());
+
+    let out = mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap();
+    match out {
+        Outcome::VerifiedReuse { record } => {
+            assert_eq!(record.uses, 1, "second reinforce_for_eval must not bump again");
+            assert_eq!(record.successes, 1);
+        }
+        other => panic!("expected VerifiedReuse, got {other:?}"),
+    }
+
+    assert!(mem
+        .decay_failed_reuse_for_eval(&scope_a(), &recorded.id, "reuse-eval-2")
+        .await
+        .unwrap());
+    assert!(!mem
+        .decay_failed_reuse_for_eval(&scope_a(), &recorded.id, "reuse-eval-2")
+        .await
+        .unwrap());
+}

@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use crate::error::{Error, Result};
 use crate::policy::Policy;
 use crate::types::{
-    now_ms, AskRecord, DecayReason, KpiRef, RecordId, RepairRecord, Scope, TableRef, Vote,
+    now_ms, AskRecord, DecayReason, KpiRef, RecordId, RepairRecord, Scope, TableRef, TrustOutcome,
+    Vote,
 };
 
 #[async_trait]
@@ -60,6 +61,20 @@ pub trait MemoryStore: Send + Sync {
     ) -> Result<Vec<RepairRecord>>;
 
     async fn invalidate_table(&self, scope: &Scope, table: &TableRef) -> Result<u64>;
+
+    /// Atomically claim `(scope, eval_id)` and apply reinforce / failed-reuse decay.
+    ///
+    /// Returns `true` if this call applied the update. Returns `false` if an event already
+    /// exists (first verdict wins — later rescored flips are ignored). Claim and counter
+    /// bump must succeed or fail together (no orphan trust rows).
+    async fn apply_trust_for_eval(
+        &self,
+        scope: &Scope,
+        eval_id: &str,
+        source_id: &RecordId,
+        outcome: TrustOutcome,
+        policy: &Policy,
+    ) -> Result<bool>;
 }
 
 /// Process-local store for unit tests and Phase 1.
@@ -71,6 +86,8 @@ pub struct InMemoryStore {
 struct Inner {
     asks: Vec<AskRecord>,
     repairs: Vec<RepairRecord>,
+    /// `(scope, eval_id)` → outcome already applied.
+    trust_events: std::collections::HashMap<(String, String), TrustOutcome>,
 }
 
 impl InMemoryStore {
@@ -313,5 +330,39 @@ impl MemoryStore for InMemoryStore {
             }
         }
         Ok(n)
+    }
+
+    async fn apply_trust_for_eval(
+        &self,
+        scope: &Scope,
+        eval_id: &str,
+        source_id: &RecordId,
+        outcome: TrustOutcome,
+        policy: &Policy,
+    ) -> Result<bool> {
+        let mut g = self.inner.lock().map_err(|_| lock_err())?;
+        let key = (scope.as_str().to_string(), eval_id.to_string());
+        if g.trust_events.contains_key(&key) {
+            return Ok(false);
+        }
+        // Apply counters first; only record the event if the ask exists.
+        let ask = find_ask_mut(&mut g.asks, scope, source_id)?;
+        match outcome {
+            TrustOutcome::Reinforce => {
+                ask.uses = ask.uses.saturating_add(1);
+                ask.successes = ask.successes.saturating_add(1);
+            }
+            TrustOutcome::DecayFailedReuse => {
+                ask.failures = ask.failures.saturating_add(1);
+                ask.strikes = ask.strikes.saturating_add(1);
+                if policy.should_ineligible_after_strikes(ask.strikes) {
+                    ask.eligible = false;
+                    ask.ineligible_reason = Some("failed_reuse".into());
+                }
+            }
+        }
+        ask.updated_at = now_ms();
+        g.trust_events.insert(key, outcome);
+        Ok(true)
     }
 }

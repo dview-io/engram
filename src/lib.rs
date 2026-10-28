@@ -31,9 +31,14 @@ pub use postgres::{vector_literal, PostgresStore};
 #[cfg(feature = "postgres")]
 pub use schema::apply_schema;
 pub use schema::{
-    ask_table_def, repair_table_def, EngramColumn, EngramIndex, EngramSchemaSpec, EngramSqlType,
-    EngramTableDef, EngramUnique, ASK_TABLE, DEFAULT_EMBEDDING_DIM, REPAIR_TABLE,
+    ask_table_def, repair_table_def, trust_table_def, EngramColumn, EngramIndex, EngramSchemaSpec,
+    EngramSqlType, EngramTableDef, EngramUnique, ASK_TABLE, DEFAULT_EMBEDDING_DIM, REPAIR_TABLE,
+    TRUST_TABLE,
 };
 pub use sql_inspect::sql_has_absolute_dates;
 pub use store::{InMemoryStore, MemoryStore};
-pub use types::*;
+pub use types::{
+    now_ms, AskQuery, AskRecord, AskSignature, DecayReason, ErrorQuery, GradedAsk, KpiRef,
+    MissReason, Outcome, PathTaken, RecordAskResult, RecordId, Recorded, RepairInput, RepairRecord,
+    SchemaFingerprint, Scope, Scores, TableRef, TimestampMs, TrustOutcome, Vote,
+};

@@ -175,6 +175,37 @@ pub enum MissReason {
     BelowSimilarity,
     EmptyStore,
     EmbedderFailed,
+    /// Host retrieve timeout (fail-open).
+    Timeout,
+    /// Store / unexpected error (fail-open).
+    Error,
+    /// Ask-memory not enabled on the host.
+    Disabled,
+}
+
+/// Outcome of grading a verified-reuse path, keyed by `(scope, eval_id)` for idempotency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum TrustOutcome {
+    Reinforce,
+    DecayFailedReuse,
+}
+
+impl TrustOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reinforce => "reinforce",
+            Self::DecayFailedReuse => "decay_failed_reuse",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reinforce" => Some(Self::Reinforce),
+            "decay_failed_reuse" => Some(Self::DecayFailedReuse),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

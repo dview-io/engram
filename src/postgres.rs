@@ -9,11 +9,11 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::policy::Policy;
-use crate::schema::{self, ASK_TABLE, REPAIR_TABLE};
+use crate::schema::{self, ASK_TABLE, REPAIR_TABLE, TRUST_TABLE};
 use crate::store::MemoryStore;
 use crate::types::{
     now_ms, AskRecord, AskSignature, DecayReason, KpiRef, PathTaken, RecordId, RepairRecord,
-    SchemaFingerprint, Scope, Scores, TableRef, Vote,
+    SchemaFingerprint, Scope, Scores, TableRef, TrustOutcome, Vote,
 };
 
 /// Format an embedding for binding as `$n::vector`.
@@ -196,6 +196,10 @@ impl PostgresStore {
 
     fn repair_table(&self) -> String {
         q(&self.schema, REPAIR_TABLE)
+    }
+
+    fn trust_table(&self) -> String {
+        q(&self.schema, TRUST_TABLE)
     }
 
     fn ensure_dim(&self, embedding: &[f32]) -> Result<()> {
@@ -684,6 +688,82 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(map_db)?;
         Ok(a.rows_affected().saturating_add(r.rows_affected()))
+    }
+
+    async fn apply_trust_for_eval(
+        &self,
+        scope: &Scope,
+        eval_id: &str,
+        source_id: &RecordId,
+        outcome: TrustOutcome,
+        policy: &Policy,
+    ) -> Result<bool> {
+        let trust_t = self.trust_table();
+        let ask_t = self.ask_table();
+        let ts = now_ms();
+        let mut tx = self.pool.begin().await.map_err(map_db)?;
+
+        let claim_sql = format!(
+            "INSERT INTO {trust_t} (scope, eval_id, source_id, outcome, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (scope, eval_id) DO NOTHING
+             RETURNING eval_id"
+        );
+        let claimed: Option<String> = sqlx::query_scalar(&claim_sql)
+            .bind(scope.as_str())
+            .bind(eval_id)
+            .bind(source_id.as_uuid())
+            .bind(outcome.as_str())
+            .bind(ts)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_db)?;
+        if claimed.is_none() {
+            tx.commit().await.map_err(map_db)?;
+            return Ok(false);
+        }
+
+        let done = match outcome {
+            TrustOutcome::Reinforce => {
+                let sql = format!(
+                    "UPDATE {ask_t} SET uses = uses + 1, successes = successes + 1, updated_at = $1
+                     WHERE scope = $2 AND id = $3"
+                );
+                sqlx::query(&sql)
+                    .bind(ts)
+                    .bind(scope.as_str())
+                    .bind(source_id.as_uuid())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_db)?
+            }
+            TrustOutcome::DecayFailedReuse => {
+                let sql = format!(
+                    "UPDATE {ask_t} SET
+                        failures = failures + 1,
+                        strikes = strikes + 1,
+                        eligible = CASE WHEN strikes + 1 >= $1 THEN FALSE ELSE eligible END,
+                        ineligible_reason = CASE WHEN strikes + 1 >= $1 THEN 'failed_reuse' ELSE ineligible_reason END,
+                        updated_at = $2
+                     WHERE scope = $3 AND id = $4"
+                );
+                sqlx::query(&sql)
+                    .bind(policy.max_strikes as i32)
+                    .bind(ts)
+                    .bind(scope.as_str())
+                    .bind(source_id.as_uuid())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(map_db)?
+            }
+        };
+        if done.rows_affected() == 0 {
+            // Roll back the claim so a retry can succeed once the source exists.
+            tx.rollback().await.map_err(map_db)?;
+            return Err(Error::NotFound(format!("ask {}", source_id.as_uuid())));
+        }
+        tx.commit().await.map_err(map_db)?;
+        Ok(true)
     }
 }
 
