@@ -24,6 +24,11 @@ use engram_dview::Memory;
 
 The host injects an `Embedder` and a `MemoryStore`. Ask records are unique on `(scope, eval_id)`.
 
+**Embeddings:** `engram_dview` does not own embedding models or API keys. Use the **same embedding
+stack (model + dimensions) as the rest of your application**. Changing the model without
+re-embedding stored rows breaks retrieve. In the DView stack, that means Cerebrum’s embedding
+provider (OpenAI or local ONNX) via the host — not a separate engram-only model.
+
 - **In-memory** store: always available (unit tests).
 - **Postgres + pgvector** (`feature = "postgres"`): `PostgresStore`. Host supplies `sqlx::PgPool`.
   - Reconcile specs: `ask_table_def` / `repair_table_def` / `EngramSchemaSpec` (JSONB columns, `vector(N)`, no HNSW in v1).

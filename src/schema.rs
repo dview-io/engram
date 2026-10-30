@@ -18,6 +18,8 @@ pub enum EngramSqlType {
     Text,
     Integer,
     BigInt,
+    /// Postgres `timestamp` (without time zone) — matches dlens audit columns.
+    Timestamp,
     Boolean,
     Uuid,
     Jsonb,
@@ -30,6 +32,7 @@ impl EngramSqlType {
             Self::Text => "text".into(),
             Self::Integer => "integer".into(),
             Self::BigInt => "bigint".into(),
+            Self::Timestamp => "timestamp".into(),
             Self::Boolean => "boolean".into(),
             Self::Uuid => "uuid".into(),
             Self::Jsonb => "jsonb".into(),
@@ -129,7 +132,7 @@ fn col(
     EngramColumn { name, ty, nullable, default_sql }
 }
 
-/// Ask-record table definition (JSONB for tables/kpis; BigInt epoch ms).
+/// Ask-record table definition (JSONB for tables/kpis; `timestamp` audit columns).
 pub fn ask_table_def(embedding_dim: u32) -> EngramTableDef {
     EngramTableDef {
         name: ASK_TABLE,
@@ -160,8 +163,8 @@ pub fn ask_table_def(embedding_dim: u32) -> EngramTableDef {
             col("strikes", EngramSqlType::Integer, false, Some("0")),
             col("eligible", EngramSqlType::Boolean, false, Some("TRUE")),
             col("ineligible_reason", EngramSqlType::Text, true, None),
-            col("created_at", EngramSqlType::BigInt, false, None),
-            col("updated_at", EngramSqlType::BigInt, false, None),
+            col("created_at", EngramSqlType::Timestamp, false, None),
+            col("updated_at", EngramSqlType::Timestamp, false, None),
         ],
         uniques: vec![EngramUnique {
             name: "engram_ask_records_scope_eval_uidx",
@@ -188,7 +191,7 @@ pub fn trust_table_def() -> EngramTableDef {
             col("eval_id", EngramSqlType::Text, false, None),
             col("source_id", EngramSqlType::Uuid, false, None),
             col("outcome", EngramSqlType::Text, false, None),
-            col("created_at", EngramSqlType::BigInt, false, None),
+            col("created_at", EngramSqlType::Timestamp, false, None),
         ],
         uniques: vec![],
         indexes: vec![EngramIndex {
@@ -217,8 +220,8 @@ pub fn repair_table_def() -> EngramTableDef {
             col("times_seen", EngramSqlType::Integer, false, Some("1")),
             col("times_fixed", EngramSqlType::Integer, false, Some("1")),
             col("eligible", EngramSqlType::Boolean, false, Some("TRUE")),
-            col("created_at", EngramSqlType::BigInt, false, None),
-            col("updated_at", EngramSqlType::BigInt, false, None),
+            col("created_at", EngramSqlType::Timestamp, false, None),
+            col("updated_at", EngramSqlType::Timestamp, false, None),
         ],
         uniques: vec![EngramUnique {
             name: "engram_repair_records_lookup_uidx",
@@ -369,6 +372,8 @@ mod tests {
         assert!(ddl.contains("PRIMARY KEY (id)"));
         assert!(ddl.contains("UNIQUE (scope, eval_id)") || ddl.contains("scope, eval_id"));
         assert!(ddl.contains("vector(32)"));
+        assert!(ddl.contains("created_at timestamp NOT NULL"));
+        assert!(ddl.contains("updated_at timestamp NOT NULL"));
         assert!(!ddl.contains("TEXT[]"));
         assert!(!ddl.to_lowercase().contains("hnsw"));
     }

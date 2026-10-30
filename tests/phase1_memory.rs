@@ -525,10 +525,7 @@ async fn empty_fingerprints_block_verified_reuse() {
     let mut qy = query(q, "6", "schema-v1");
     qy.fingerprints = vec![];
     let out = mem.retrieve(&scope_a(), &qy).await.unwrap();
-    assert!(
-        !matches!(out, Outcome::VerifiedReuse { .. }),
-        "empty fingerprints must not verify"
-    );
+    assert!(!matches!(out, Outcome::VerifiedReuse { .. }), "empty fingerprints must not verify");
 }
 
 #[tokio::test]

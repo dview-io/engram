@@ -203,13 +203,7 @@ where
         eval_id: &str,
     ) -> Result<bool> {
         self.store
-            .apply_trust_for_eval(
-                scope,
-                eval_id,
-                source_id,
-                TrustOutcome::Reinforce,
-                &self.policy,
-            )
+            .apply_trust_for_eval(scope, eval_id, source_id, TrustOutcome::Reinforce, &self.policy)
             .await
     }
 

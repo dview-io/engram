@@ -38,7 +38,7 @@ pub use schema::{
 pub use sql_inspect::sql_has_absolute_dates;
 pub use store::{InMemoryStore, MemoryStore};
 pub use types::{
-    now_ms, AskQuery, AskRecord, AskSignature, DecayReason, ErrorQuery, GradedAsk, KpiRef,
+    now, now_ms, AskQuery, AskRecord, AskSignature, DecayReason, ErrorQuery, GradedAsk, KpiRef,
     MissReason, Outcome, PathTaken, RecordAskResult, RecordId, Recorded, RepairInput, RepairRecord,
-    SchemaFingerprint, Scope, Scores, TableRef, TimestampMs, TrustOutcome, Vote,
+    SchemaFingerprint, Scope, Scores, TableRef, Timestamp, TimestampMs, TrustOutcome, Vote,
 };

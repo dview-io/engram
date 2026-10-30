@@ -130,8 +130,7 @@ pub fn fingerprints_cover_tables(
     tables: &[TableRef],
     fingerprints: &[(TableRef, SchemaFingerprint)],
 ) -> bool {
-    !tables.is_empty()
-        && tables.iter().all(|t| fingerprints.iter().any(|(ft, _)| ft == t))
+    !tables.is_empty() && tables.iter().all(|t| fingerprints.iter().any(|(ft, _)| ft == t))
 }
 
 fn signatures_match(a: &AskSignature, b: &AskSignature) -> bool {

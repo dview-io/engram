@@ -1,7 +1,7 @@
 //! Text-to-SQL memory domain types.
 
+use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Tenant / org isolation key. Required on every call.
@@ -237,14 +237,19 @@ impl Default for RecordId {
     }
 }
 
-/// Unix epoch milliseconds.
-pub type TimestampMs = i64;
+/// Wall-clock time stored as Postgres `timestamp` (naive UTC).
+pub type Timestamp = NaiveDateTime;
 
-pub fn now_ms() -> TimestampMs {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(TimestampMs::MAX))
-        .unwrap_or(0)
+/// Prefer [`Timestamp`] / [`now`]. Kept as an alias for older call sites.
+pub type TimestampMs = Timestamp;
+
+pub fn now() -> Timestamp {
+    Utc::now().naive_utc()
+}
+
+/// Prefer [`now`].
+pub fn now_ms() -> Timestamp {
+    now()
 }
 
 /// Graded ask stored for retrieve / few-shot / verified reuse.

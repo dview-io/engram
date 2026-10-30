@@ -75,18 +75,13 @@ fn test_schema_name() -> String {
 
 fn drop_schema_after_test() -> bool {
     load_env();
-    matches!(
-        std::env::var("ENGRAM_TEST_DROP_SCHEMA").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
+    matches!(std::env::var("ENGRAM_TEST_DROP_SCHEMA").as_deref(), Ok("1") | Ok("true") | Ok("TRUE"))
 }
 
 /// Serializes Phase 2 tests that share one schema (truncate is not parallel-safe).
 fn test_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 async fn schema_exists(pool: &PgPool, schema: &str) -> bool {
@@ -196,9 +191,7 @@ impl TestDb {
                     .expect("recreate engram test schema");
             }
         } else {
-            apply_schema(&pool, &schema, embedding_dim())
-                .await
-                .expect("create engram test schema");
+            apply_schema(&pool, &schema, embedding_dim()).await.expect("create engram test schema");
         }
 
         Some(Self { pool, schema, _lock })
@@ -564,14 +557,8 @@ async fn postgres_trust_for_eval_is_atomic_and_idempotent() {
     let q = "monthly revenue by region last 6 months";
     let recorded = store_ask(&mem, graded("e1", q, "6", RELATIVE_SQL, "schema-v1")).await;
 
-    assert!(mem
-        .reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1")
-        .await
-        .unwrap());
-    assert!(!mem
-        .reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1")
-        .await
-        .unwrap());
+    assert!(mem.reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1").await.unwrap());
+    assert!(!mem.reinforce_for_eval(&scope_a(), &recorded.id, "reuse-eval-1").await.unwrap());
 
     let out = mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap();
     match out {
