@@ -81,7 +81,8 @@ async fn store(
     match mem.record_ask(&scope_a(), ask).await.unwrap() {
         RecordAskResult::Stored(r) => r,
         RecordAskResult::SkippedBelowThreshold => panic!("unexpected skip"),
-        _ => panic!("unexpected record result"),
+        RecordAskResult::Retracted { .. } => panic!("unexpected retract"),
+        other => panic!("unexpected record result: {other:?}"),
     }
 }
 
@@ -200,6 +201,60 @@ async fn scope_isolation() {
 
     let out = mem.retrieve(&scope_b(), &query(q, "6", "schema-v1")).await.unwrap();
     assert!(matches!(out, Outcome::Miss { reason: MissReason::EmptyStore }));
+}
+
+#[tokio::test]
+async fn below_threshold_regrade_retracts_existing_ask() {
+    let mem = memory(Policy::default());
+    let q = "monthly revenue by region last 6 months";
+    store(&mem, graded("e1", q, "6", RELATIVE_SQL, "schema-v1")).await;
+    assert!(matches!(
+        mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap(),
+        Outcome::VerifiedReuse { .. }
+    ));
+
+    let mut low = graded("e1", q, "6", "SELECT 2", "schema-v1");
+    low.scores.final_score = Some(10.0);
+    low.scores.sql_score = Some(1.0);
+    let result = mem.record_ask(&scope_a(), low).await.unwrap();
+    assert!(matches!(result, RecordAskResult::Retracted { .. }), "{result:?}");
+
+    let out = mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap();
+    assert!(matches!(out, Outcome::Miss { .. }), "retracted ask must not reuse: {out:?}");
+}
+
+#[tokio::test]
+async fn good_regrade_restores_eligibility_after_retract() {
+    let mem = memory(Policy::default());
+    let q = "monthly revenue by region last 6 months";
+    store(&mem, graded("e1", q, "6", RELATIVE_SQL, "schema-v1")).await;
+
+    let mut low = graded("e1", q, "6", "SELECT 2", "schema-v1");
+    low.scores.final_score = Some(10.0);
+    low.scores.sql_score = Some(1.0);
+    mem.record_ask(&scope_a(), low).await.unwrap();
+    assert!(matches!(
+        mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap(),
+        Outcome::Miss { .. }
+    ));
+
+    let mut high = graded(
+        "e1",
+        q,
+        "6",
+        "SELECT region, sum(amount) FROM sales.public.orders GROUP BY 1",
+        "schema-v1",
+    );
+    high.scores.final_score = Some(88.0);
+    high.scores.sql_score = Some(9.0);
+    let result = mem.record_ask(&scope_a(), high).await.unwrap();
+    assert!(matches!(result, RecordAskResult::Stored(_)), "{result:?}");
+
+    let out = mem.retrieve(&scope_a(), &query(q, "6", "schema-v1")).await.unwrap();
+    assert!(
+        matches!(out, Outcome::VerifiedReuse { .. } | Outcome::FewShot { .. }),
+        "reopened after good regrade: {out:?}"
+    );
 }
 
 #[tokio::test]

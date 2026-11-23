@@ -109,7 +109,11 @@ where
 
     pub async fn record_ask(&self, scope: &Scope, ask: GradedAsk) -> Result<RecordAskResult> {
         if !self.policy.is_storable(ask.scores.final_score, ask.scores.sql_score) {
-            return Ok(RecordAskResult::SkippedBelowThreshold);
+            // Re-grade below threshold must not leave an older good row eligible for reuse.
+            return self.retract_ask_by_eval(scope, &ask.eval_id).await.map(|id| match id {
+                Some(id) => RecordAskResult::Retracted { id },
+                None => RecordAskResult::SkippedBelowThreshold,
+            });
         }
 
         let sql_has_absolute_dates = sql_has_absolute_dates(&ask.sql);
@@ -233,6 +237,28 @@ where
 
     pub async fn invalidate_table(&self, scope: &Scope, table: &TableRef) -> Result<u64> {
         self.store.invalidate_table(scope, table).await
+    }
+
+    /// Mark the ask for `(scope, eval_id)` ineligible when a re-grade falls below store threshold.
+    ///
+    /// Returns the record id when a row was found and updated; `None` if none existed.
+    pub async fn retract_ask_by_eval(
+        &self,
+        scope: &Scope,
+        eval_id: &str,
+    ) -> Result<Option<RecordId>> {
+        let Some(existing) = self.store.get_ask_by_eval(scope, eval_id).await? else {
+            return Ok(None);
+        };
+        if !existing.eligible
+            && existing.ineligible_reason.as_deref() == Some("regraded_below_threshold")
+        {
+            return Ok(Some(existing.id));
+        }
+        self.store
+            .apply_decay(scope, &existing.id, DecayReason::RegradedBelowThreshold, &self.policy)
+            .await?;
+        Ok(Some(existing.id))
     }
 }
 

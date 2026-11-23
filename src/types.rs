@@ -164,6 +164,8 @@ pub enum DecayReason {
     NegativeFeedback,
     TableInvalidated,
     Manual,
+    /// Ask was re-graded below the store threshold; keep the row but stop reuse.
+    RegradedBelowThreshold,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,4 +373,8 @@ pub struct Recorded {
 pub enum RecordAskResult {
     Stored(Recorded),
     SkippedBelowThreshold,
+    /// An existing row for this eval was marked ineligible after a below-threshold regrade.
+    Retracted {
+        id: RecordId,
+    },
 }

@@ -153,6 +153,11 @@ impl MemoryStore for InMemoryStore {
             existing.scores = record.scores;
             existing.path_taken = record.path_taken;
             existing.expert = record.expert;
+            // A later good grade may reopen a row retracted only for below-threshold regrade.
+            if existing.ineligible_reason.as_deref() == Some("regraded_below_threshold") {
+                existing.eligible = true;
+                existing.ineligible_reason = None;
+            }
             existing.updated_at = now_ms();
             return Ok((id, false));
         }
@@ -245,6 +250,10 @@ impl MemoryStore for InMemoryStore {
             DecayReason::Manual => {
                 ask.eligible = false;
                 ask.ineligible_reason = Some("manual".into());
+            }
+            DecayReason::RegradedBelowThreshold => {
+                ask.eligible = false;
+                ask.ineligible_reason = Some("regraded_below_threshold".into());
             }
         }
         ask.updated_at = now_ms();

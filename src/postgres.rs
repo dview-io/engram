@@ -323,6 +323,12 @@ impl MemoryStore for PostgresStore {
                 scores = EXCLUDED.scores,
                 path_taken = EXCLUDED.path_taken,
                 expert = EXCLUDED.expert,
+                eligible = CASE
+                    WHEN {table}.ineligible_reason = 'regraded_below_threshold' THEN TRUE
+                    ELSE {table}.eligible END,
+                ineligible_reason = CASE
+                    WHEN {table}.ineligible_reason = 'regraded_below_threshold' THEN NULL
+                    ELSE {table}.ineligible_reason END,
                 updated_at = EXCLUDED.updated_at
              RETURNING id, (xmax = 0) AS created"
         );
@@ -551,6 +557,19 @@ impl MemoryStore for PostgresStore {
             DecayReason::Manual => {
                 let sql = format!(
                     "UPDATE {table} SET eligible = FALSE, ineligible_reason = 'manual', updated_at = $1
+                     WHERE scope = $2 AND id = $3"
+                );
+                sqlx::query(&sql)
+                    .bind(ts)
+                    .bind(scope.as_str())
+                    .bind(id.as_uuid())
+                    .execute(&self.pool)
+                    .await
+                    .map_err(map_db)?
+            }
+            DecayReason::RegradedBelowThreshold => {
+                let sql = format!(
+                    "UPDATE {table} SET eligible = FALSE, ineligible_reason = 'regraded_below_threshold', updated_at = $1
                      WHERE scope = $2 AND id = $3"
                 );
                 sqlx::query(&sql)
