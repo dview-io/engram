@@ -119,7 +119,20 @@ async fn schema_is_current(pool: &PgPool, schema: &str) -> bool {
     .await
     .unwrap_or(false);
 
-    has_trust && tables_is_jsonb
+    let created_at_is_timestamp: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = $2
+              AND column_name = 'created_at' AND udt_name = 'timestamp'
+         )",
+    )
+    .bind(schema)
+    .bind(ASK_TABLE)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    has_trust && tables_is_jsonb && created_at_is_timestamp
 }
 
 async fn drop_schema(pool: &PgPool, schema: &str) {
@@ -267,6 +280,7 @@ fn signature_window(months: &str) -> AskSignature {
         window: Some(format!("last {months} months")),
         filters: Default::default(),
         top_n: None,
+        ..Default::default()
     }
 }
 
@@ -439,7 +453,13 @@ async fn postgres_vector_search_nearest_first_and_scope() {
     store_ask(&mem, graded("near", q, "6", RELATIVE_SQL, "schema-v1")).await;
     store_ask(
         &mem,
-        graded("far", "totally unrelated kitchen sink query", "6", RELATIVE_SQL, "schema-v1"),
+        graded(
+            "far",
+            "totally unrelated kitchen sink query",
+            "6",
+            &format!("{RELATIVE_SQL} ORDER BY 1"),
+            "schema-v1",
+        ),
     )
     .await;
 

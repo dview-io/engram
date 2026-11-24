@@ -428,18 +428,17 @@ impl MemoryStore for PostgresStore {
         let cols = Self::ask_select_cols();
         let vector = vector_literal(embedding)?;
         // Exact scan within scope first — no ANN index (avoids cross-tenant HNSW misses).
+        // Table pushdown uses non-empty overlap (`?|`) so few-shot can match across table-search
+        // noise; verified reuse enforces subset in policy (4y.5).
         let sql = format!(
             "SELECT {cols} FROM {table}
              WHERE scope = $1 AND eligible = TRUE
-               AND ($3::jsonb IS NULL OR tables = $3)
+               AND ($3::text[] IS NULL OR tables ?| $3)
                AND ($4::jsonb IS NULL OR kpis = $4)
              ORDER BY embedding <=> $2::vector
              LIMIT $5"
         );
-        let tables_json = match tables {
-            Some(t) => Some(strings_json(&sorted_table_strings(t))?),
-            None => None,
-        };
+        let tables_arr: Option<Vec<String>> = tables.map(sorted_table_strings);
         let kpis_json = match kpis {
             Some(k) => Some(strings_json(&sorted_kpi_strings(k))?),
             None => None,
@@ -447,7 +446,7 @@ impl MemoryStore for PostgresStore {
         let rows = sqlx::query(&sql)
             .bind(scope.as_str())
             .bind(&vector)
-            .bind(tables_json)
+            .bind(tables_arr)
             .bind(kpis_json)
             .bind(limit.max(1) as i64)
             .fetch_all(&self.pool)

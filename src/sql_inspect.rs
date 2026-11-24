@@ -1,9 +1,13 @@
 //! SQL inspection for reuse safety (absolute date literals, etc.).
 
-use sqlparser::ast::{Expr, Value as AstValue, Visit, Visitor};
+use std::collections::HashSet;
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{Expr, ObjectName, Query, Value as AstValue, Visit, Visitor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::ops::ControlFlow;
+
+use crate::types::TableRef;
 
 /// Returns true when the SQL contains absolute date / timestamp string literals
 /// that would make "last N months" style questions unsafe to replay.
@@ -83,6 +87,177 @@ fn looks_like_ymd(text: &str, sep: u8) -> bool {
                 && d0.is_ascii_digit()
                 && d1.is_ascii_digit()
     )
+}
+
+/// Extract lowercased, unquoted table names referenced in `FROM`/`JOIN` clauses (4y.4).
+///
+/// CTE names declared in `WITH` clauses are excluded. Returns an empty `Vec` if the SQL
+/// cannot be parsed or references no tables.
+pub fn sql_referenced_tables(sql: &str) -> Vec<String> {
+    let dialect = GenericDialect {};
+    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
+        return Vec::new();
+    };
+    let mut visitor = TableRefVisitor::default();
+    for statement in &statements {
+        let _ = statement.visit(&mut visitor);
+    }
+    let mut out: Vec<String> = visitor
+        .relations
+        .into_iter()
+        .filter(|rel| {
+            // Single-part name matching a CTE alias is a CTE, not a base table.
+            rel.contains('.') || !visitor.ctes.contains(rel)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Narrow candidate `tables` (e.g. from table search) to only those referenced by `sql` (4y.4).
+///
+/// Normalize SQL for deduplication (4y.10): strip `--` and `/* */` comments outside string
+/// literals, collapse whitespace outside string literals, lowercase outside `'...'` string
+/// literals, and trim trailing `;`.
+pub fn normalize_sql(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let chars: Vec<char> = sql.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    let mut prev_space = true; // trim leading whitespace
+
+    while i < n {
+        let c = chars[i];
+        // Single-quoted string literal: preserve exact casing, whitespace, and `--` / `/*`.
+        if c == '\'' {
+            out.push('\'');
+            i += 1;
+            while i < n {
+                let sc = chars[i];
+                out.push(sc);
+                i += 1;
+                if sc == '\'' {
+                    if i < n && chars[i] == '\'' {
+                        // Escaped '' inside string literal.
+                        out.push('\'');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            prev_space = false;
+            continue;
+        }
+        // Line comment: -- ... \n
+        if c == '-' && i + 1 < n && chars[i + 1] == '-' {
+            i += 2;
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        // Block comment: /* ... */
+        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < n && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            i += 1;
+            continue;
+        }
+        for lc in c.to_lowercase() {
+            out.push(lc);
+        }
+        prev_space = false;
+        i += 1;
+    }
+
+    out.trim().trim_end_matches(';').trim().to_string()
+}
+
+/// Stable 64-bit FNV-1a hex hash of [`normalize_sql`] (4y.10).
+pub fn normalized_sql_hash(sql: &str) -> String {
+    let norm = normalize_sql(sql);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in norm.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Matches exact FQN or dot-separated suffix (`schema.table` / `table`). Falls back to
+/// `candidates` unchanged when `sql` cannot be parsed or no candidate matches.
+pub fn filter_tables_to_sql(candidates: &[TableRef], sql: &str) -> Vec<TableRef> {
+    let referenced = sql_referenced_tables(sql);
+    if referenced.is_empty() || candidates.is_empty() {
+        return candidates.to_vec();
+    }
+    let matched: Vec<TableRef> = candidates
+        .iter()
+        .filter(|cand| {
+            let c = cand.as_str().trim().to_lowercase();
+            referenced
+                .iter()
+                .any(|r| c == *r || c.ends_with(&format!(".{r}")) || r.ends_with(&format!(".{c}")))
+        })
+        .cloned()
+        .collect();
+    if matched.is_empty() {
+        candidates.to_vec()
+    } else {
+        matched
+    }
+}
+
+#[derive(Default)]
+struct TableRefVisitor {
+    ctes: HashSet<String>,
+    relations: Vec<String>,
+}
+
+impl Visitor for TableRefVisitor {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.ctes.insert(cte.alias.name.value.trim().to_lowercase());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+        let parts: Vec<String> = relation
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(|i| i.value.trim().to_lowercase()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            self.relations.push(parts.join("."));
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 #[cfg(test)]

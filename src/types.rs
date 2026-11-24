@@ -95,36 +95,244 @@ impl From<&str> for SchemaFingerprint {
     }
 }
 
-/// Structured intent extracted before SQL generation.
+/// One structured filter predicate in [`AskSignature`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SignatureFilter {
+    #[serde(default)]
+    pub column: String,
+    #[serde(default)]
+    pub op: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
+}
+
+/// Structured relative/anchored time window in [`AskSignature`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureWindow {
+    /// Canonical singular unit: `hour`, `day`, `week`, `month`, `quarter`, `year`.
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
+    /// Optional anchor, e.g. `now`, `current_date`, `mtd`, `ytd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+}
+
+/// Structured intent extracted before SQL generation (Phase 4y.2–4y.3).
 ///
-/// Hosts should normalize dimensions (sorted, lowercased) and window phrasing before
-/// calling retrieve / record. Matching is exact on the values provided.
+/// When structured fields (`aggregation`, `columns`, `group_by`, `structured_filters`,
+/// `structured_window`) are populated, verified-reuse comparison uses **only** those
+/// answer-changing fields plus `top_n` (after [`Self::normalize`]); free-text `metric` prose
+/// is ignored so phrasing drift does not block reuse.
+///
+/// Legacy flat fields (`metric`, `dimensions`, `grain`, `window`, `filters`) remain with
+/// `#[serde(default)]` so existing DB rows deserialize cleanly. A structured query never
+/// matches a legacy-only row.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AskSignature {
-    pub metric: Option<String>,
-    pub dimensions: Vec<String>,
-    pub grain: Option<String>,
-    /// Time window as stated, e.g. `last 6 months`.
-    pub window: Option<String>,
-    pub filters: serde_json::Map<String, serde_json::Value>,
+    /// Structured aggregation token (`sum`, `count`, `count_distinct`, `avg`, `min`, `max`, `list`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<String>,
+    /// Target / measure columns referenced by the ask (sorted, lowercased).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// Grouping columns (sorted, lowercased).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_by: Vec<String>,
+    /// Structured filter predicates `{column, op, value}` (normalized + sorted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structured_filters: Vec<SignatureFilter>,
+    /// Structured time window `{unit, count, anchor}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_window: Option<SignatureWindow>,
+    /// Optional explicit top-N limit. Compared exact (`None` != `Some(10)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u32>,
+
+    // Legacy free-text fields (kept for backward-compat JSONB deserialization; ignored when
+    // structured fields are present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grain: Option<String>,
+    /// Legacy time window as stated, e.g. `last 6 months`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub filters: serde_json::Map<String, serde_json::Value>,
 }
 
 impl AskSignature {
+    /// True when any Phase 4y.2 structured field is populated.
+    pub fn has_structured_fields(&self) -> bool {
+        self.aggregation.as_ref().is_some_and(|s| !s.trim().is_empty())
+            || self.columns.iter().any(|c| !c.trim().is_empty())
+            || self.group_by.iter().any(|g| !g.trim().is_empty())
+            || self.structured_filters.iter().any(|f| !f.column.trim().is_empty())
+            || self.structured_window.as_ref().is_some_and(|w| !w.unit.trim().is_empty())
+    }
+
+    /// Normalize casing, synonyms, and sort order in place.
+    pub fn normalize(&mut self) {
+        self.aggregation = self.aggregation.as_deref().and_then(normalize_aggregation);
+        normalize_ident_list(&mut self.columns);
+        normalize_ident_list(&mut self.group_by);
+        self.structured_filters = std::mem::take(&mut self.structured_filters)
+            .into_iter()
+            .filter_map(normalize_filter)
+            .collect();
+        self.structured_filters.sort_by(|a, b| {
+            a.column
+                .cmp(&b.column)
+                .then_with(|| a.op.cmp(&b.op))
+                .then_with(|| json_sort_key(&a.value).cmp(&json_sort_key(&b.value)))
+        });
+        self.structured_filters.dedup();
+        self.structured_window = self.structured_window.take().and_then(normalize_window);
+        if self.top_n == Some(0) {
+            self.top_n = None;
+        }
+
+        // Legacy fields
+        self.metric = normalize_opt_lower(self.metric.as_deref());
+        normalize_ident_list(&mut self.dimensions);
+        self.grain = normalize_opt_lower(self.grain.as_deref());
+        self.window = normalize_opt_lower(self.window.as_deref());
+    }
+
+    /// Return a normalized copy without mutating `self`.
+    pub fn normalized(&self) -> Self {
+        let mut copy = self.clone();
+        copy.normalize();
+        copy
+    }
+
     /// Enough structure to safely gate verified reuse (not an empty default).
     pub fn is_reuse_ready(&self) -> bool {
+        if self.has_structured_fields() {
+            return self.aggregation.as_ref().is_some_and(|s| !s.trim().is_empty())
+                || self.columns.iter().any(|c| !c.trim().is_empty())
+                || self.structured_window.as_ref().is_some_and(|w| !w.unit.trim().is_empty());
+        }
         self.metric.as_ref().is_some_and(|m| !m.trim().is_empty())
             || self.window.as_ref().is_some_and(|w| !w.trim().is_empty())
     }
 
+    /// Reuse comparison (Phase 4y.3):
+    /// - Both structured → compare only answer-changing structured fields + `top_n` (ignore prose `metric`).
+    /// - Mixed structured vs legacy → never match.
+    /// - Both legacy → exact match on legacy fields.
     pub fn matches(&self, other: &AskSignature) -> bool {
-        self.metric == other.metric
-            && self.dimensions == other.dimensions
-            && self.grain == other.grain
-            && self.window == other.window
-            && self.filters == other.filters
-            && self.top_n == other.top_n
+        let a = self.normalized();
+        let b = other.normalized();
+        match (a.has_structured_fields(), b.has_structured_fields()) {
+            (true, true) => {
+                a.aggregation == b.aggregation
+                    && a.columns == b.columns
+                    && a.group_by == b.group_by
+                    && a.structured_filters == b.structured_filters
+                    && a.structured_window == b.structured_window
+                    && a.top_n == b.top_n
+            }
+            (false, false) => {
+                a.metric == b.metric
+                    && a.dimensions == b.dimensions
+                    && a.grain == b.grain
+                    && a.window == b.window
+                    && a.filters == b.filters
+                    && a.top_n == b.top_n
+            }
+            _ => false,
+        }
     }
+}
+
+fn normalize_opt_lower(v: Option<&str>) -> Option<String> {
+    v.map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase)
+}
+
+fn normalize_ident_list(items: &mut Vec<String>) {
+    *items = items.iter().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+    items.sort();
+    items.dedup();
+}
+
+fn normalize_aggregation(raw: &str) -> Option<String> {
+    let s = raw.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let canon = match s.as_str() {
+        "total" | "sum" => "sum",
+        "count" => "count",
+        "count_distinct" | "count distinct" | "distinct_count" | "distinct count" => {
+            "count_distinct"
+        }
+        "avg" | "average" | "mean" => "avg",
+        "min" | "minimum" => "min",
+        "max" | "maximum" => "max",
+        "list" | "select" | "detail" | "rows" => "list",
+        other => return Some(other.to_string()),
+    };
+    Some(canon.to_string())
+}
+
+fn normalize_op(raw: &str) -> String {
+    match raw.trim().to_lowercase().as_str() {
+        "==" | "eq" => "=".to_string(),
+        "<>" | "neq" | "!=" => "!=".to_string(),
+        "gt" => ">".to_string(),
+        "gte" | ">=" => ">=".to_string(),
+        "lt" => "<".to_string(),
+        "lte" | "<=" => "<=".to_string(),
+        "not in" => "not_in".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_filter_value(val: serde_json::Value) -> serde_json::Value {
+    match val {
+        serde_json::Value::String(s) => serde_json::Value::String(s.trim().to_lowercase()),
+        serde_json::Value::Array(arr) => {
+            let mut norm: Vec<serde_json::Value> =
+                arr.into_iter().map(normalize_filter_value).collect();
+            norm.sort_by_key(json_sort_key);
+            serde_json::Value::Array(norm)
+        }
+        other => other,
+    }
+}
+
+fn normalize_filter(f: SignatureFilter) -> Option<SignatureFilter> {
+    let column = f.column.trim().to_lowercase();
+    if column.is_empty() {
+        return None;
+    }
+    let op = normalize_op(&f.op);
+    let value = normalize_filter_value(f.value);
+    Some(SignatureFilter { column, op, value })
+}
+
+fn normalize_window(w: SignatureWindow) -> Option<SignatureWindow> {
+    let unit = match w.unit.trim().to_lowercase().as_str() {
+        "" => return None,
+        "hour" | "hours" | "hr" | "hrs" => "hour".to_string(),
+        "day" | "days" => "day".to_string(),
+        "week" | "weeks" | "wk" | "wks" => "week".to_string(),
+        "month" | "months" | "mo" | "mos" => "month".to_string(),
+        "quarter" | "quarters" | "qtr" | "qtrs" => "quarter".to_string(),
+        "year" | "years" | "yr" | "yrs" => "year".to_string(),
+        other => other.to_string(),
+    };
+    let anchor = normalize_opt_lower(w.anchor.as_deref());
+    Some(SignatureWindow { unit, count: w.count, anchor })
+}
+
+fn json_sort_key(v: &serde_json::Value) -> String {
+    serde_json::to_string(v).unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +583,12 @@ pub enum RecordAskResult {
     SkippedBelowThreshold,
     /// An existing row for this eval was marked ineligible after a below-threshold regrade.
     Retracted {
+        id: RecordId,
+    },
+    /// Skipped because the ask was already served via `VerifiedReuse` (4y.10).
+    SkippedVerifiedReuse,
+    /// Skipped because an eligible row with the same normalized SQL + tables + signature already exists (4y.10).
+    Deduplicated {
         id: RecordId,
     },
 }

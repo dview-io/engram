@@ -15,6 +15,7 @@ pub mod policy;
 pub mod schema;
 pub mod sql_inspect;
 pub mod store;
+pub mod trace;
 pub mod types;
 
 #[cfg(feature = "postgres")]
@@ -35,10 +36,17 @@ pub use schema::{
     EngramSqlType, EngramTableDef, EngramUnique, ASK_TABLE, DEFAULT_EMBEDDING_DIM, REPAIR_TABLE,
     TRUST_TABLE,
 };
-pub use sql_inspect::sql_has_absolute_dates;
+pub use sql_inspect::{
+    filter_tables_to_sql, normalize_sql, normalized_sql_hash, sql_has_absolute_dates,
+    sql_referenced_tables,
+};
 pub use store::{InMemoryStore, MemoryStore};
+pub use trace::{
+    reject_name, CandidateTrace, FieldDiff, FingerprintDiff, RejectReason, RetrieveTrace, SetDiff,
+};
 pub use types::{
     now, now_ms, AskQuery, AskRecord, AskSignature, DecayReason, ErrorQuery, GradedAsk, KpiRef,
     MissReason, Outcome, PathTaken, RecordAskResult, RecordId, Recorded, RepairInput, RepairRecord,
-    SchemaFingerprint, Scope, Scores, TableRef, Timestamp, TimestampMs, TrustOutcome, Vote,
+    SchemaFingerprint, Scope, Scores, SignatureFilter, SignatureWindow, TableRef, Timestamp,
+    TimestampMs, TrustOutcome, Vote,
 };

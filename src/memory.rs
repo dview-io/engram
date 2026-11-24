@@ -5,14 +5,16 @@ use std::sync::Arc;
 use crate::embedder::Embedder;
 use crate::error::{Error, Result};
 use crate::policy::{
-    hard_filter, pick_verified_reuse, score_similarity, sort_for_few_shot, Policy, RankedCandidate,
+    hard_filter, pick_verified_reuse, reuse_gate_reject, score_similarity, sort_for_few_shot,
+    table_overlap_ratio, Policy, RankedCandidate,
 };
-use crate::sql_inspect::sql_has_absolute_dates;
+use crate::sql_inspect::{filter_tables_to_sql, normalized_sql_hash, sql_has_absolute_dates};
 use crate::store::MemoryStore;
+use crate::trace::{CandidateTrace, RejectReason, RetrieveTrace};
 use crate::types::{
     now_ms, AskQuery, AskRecord, DecayReason, ErrorQuery, GradedAsk, MissReason, Outcome,
-    RecordAskResult, RecordId, Recorded, RepairInput, RepairRecord, Scope, TableRef, TrustOutcome,
-    Vote,
+    PathTaken, RecordAskResult, RecordId, Recorded, RepairInput, RepairRecord, Scope, TableRef,
+    TrustOutcome, Vote,
 };
 
 pub struct Memory<S, E> {
@@ -35,19 +37,34 @@ where
     }
 
     pub async fn retrieve(&self, scope: &Scope, ask: &AskQuery) -> Result<Outcome> {
+        self.retrieve_traced(scope, ask).await.map(|(outcome, _)| outcome)
+    }
+
+    /// Same decision as [`Self::retrieve`], plus a per-candidate [`RetrieveTrace`] (4y.1).
+    ///
+    /// The trace is diagnostic: it never changes which outcome is returned.
+    pub async fn retrieve_traced(
+        &self,
+        scope: &Scope,
+        ask: &AskQuery,
+    ) -> Result<(Outcome, RetrieveTrace)> {
+        let mut trace = RetrieveTrace::new(ask, self.policy.candidate_fetch_limit);
         if ask.question.trim().is_empty() {
             return Err(Error::Invalid("question must not be empty".into()));
         }
         let embedding = match self.embedder.embed(&ask.question).await {
             Ok(v) => v,
             Err(_) => {
-                return Ok(Outcome::Miss { reason: MissReason::EmbedderFailed });
+                trace.miss(MissReason::EmbedderFailed);
+                return Ok((Outcome::Miss { reason: MissReason::EmbedderFailed }, trace));
             }
         };
 
         if !self.store.has_eligible_asks(scope).await? {
-            return Ok(Outcome::Miss { reason: MissReason::EmptyStore });
+            trace.miss(MissReason::EmptyStore);
+            return Ok((Outcome::Miss { reason: MissReason::EmptyStore }, trace));
         }
+        trace.store_has_eligible = true;
 
         // Push table/KPI filters into the store so LIMIT isn't wasted on other tables.
         let candidates = self
@@ -60,40 +77,105 @@ where
                 Some(&ask.kpis),
             )
             .await?;
+        trace.store_rows = candidates.len();
         if candidates.is_empty() {
-            return Ok(Outcome::Miss { reason: MissReason::HardFilter });
+            // Store-side table/KPI pushdown removed every row that was eligible in scope.
+            trace.miss(MissReason::HardFilter);
+            return Ok((Outcome::Miss { reason: MissReason::HardFilter }, trace));
         }
 
         let mut ranked = Vec::new();
         for record in candidates {
+            let mut candidate = CandidateTrace::new(ask, &record);
             // Store already filtered tables/KPIs; keep hard_filter as a safety net.
             if !hard_filter(ask, &record) {
+                let reason = if record.eligible {
+                    RejectReason::TableOrKpiSet
+                } else {
+                    RejectReason::Ineligible
+                };
+                candidate.few_shot_reject = Some(reason);
+                candidate.reuse_reject = Some(reason);
+                trace.candidates.push(candidate);
                 continue;
             }
             let Ok(similarity) = score_similarity(&embedding, &record) else {
+                candidate.few_shot_reject = Some(RejectReason::ScoreFailed);
+                candidate.reuse_reject = Some(RejectReason::ScoreFailed);
+                trace.candidates.push(candidate);
                 continue;
             };
+            candidate.similarity = Some(similarity);
             if similarity < self.policy.few_shot_similarity_min {
+                candidate.few_shot_reject = Some(RejectReason::BelowFewShotSimilarity);
+                candidate.reuse_reject = Some(RejectReason::BelowFewShotSimilarity);
+                trace.candidates.push(candidate);
                 continue;
             }
-            ranked.push(RankedCandidate { record, similarity });
+            candidate.reuse_reject = if !self.policy.verified_reuse_enabled {
+                Some(RejectReason::ReuseDisabled)
+            } else if similarity < self.policy.verified_reuse_similarity_min {
+                Some(RejectReason::BelowReuseSimilarity)
+            } else if !self.policy.is_reuse_score_eligible(record.expert, &record.scores) {
+                Some(RejectReason::BelowReuseScore)
+            } else {
+                reuse_gate_reject(ask, &record)
+            };
+            let table_overlap = table_overlap_ratio(&ask.tables, &record.tables);
+            trace.candidates.push(candidate);
+            ranked.push(RankedCandidate { record, similarity, table_overlap });
         }
 
         if ranked.is_empty() {
-            return Ok(Outcome::Miss { reason: MissReason::BelowSimilarity });
+            trace.miss(MissReason::BelowSimilarity);
+            return Ok((Outcome::Miss { reason: MissReason::BelowSimilarity }, trace));
         }
 
         if let Some(reuse) = pick_verified_reuse(&ranked, ask, &self.policy) {
-            return Ok(Outcome::VerifiedReuse { record: Box::new(reuse.record.clone()) });
+            let winner = reuse.record.id.clone();
+            let outcome = Outcome::VerifiedReuse { record: Box::new(reuse.record.clone()) };
+            for candidate in &mut trace.candidates {
+                if candidate.id == winner {
+                    candidate.selected = Some(PathTaken::VerifiedReuse);
+                } else if candidate.reuse_reject.is_none() {
+                    candidate.reuse_reject = Some(RejectReason::LowerRankedReuse);
+                }
+                if candidate.few_shot_reject.is_none() {
+                    candidate.few_shot_reject = Some(RejectReason::ReusedInstead);
+                }
+            }
+            trace.path = Some(PathTaken::VerifiedReuse);
+            return Ok((outcome, trace));
         }
 
         let ranked = sort_for_few_shot(ranked);
         let limit = self.policy.few_shot_limit.max(1);
-        let examples: Vec<AskRecord> = ranked.into_iter().take(limit).map(|c| c.record).collect();
+        let examples: Vec<AskRecord> = ranked
+            .into_iter()
+            .enumerate()
+            .filter_map(|(rank, c)| {
+                if rank < limit {
+                    Some(c.record)
+                } else {
+                    // Mark overflow rows; the record itself is dropped here.
+                    if let Some(t) = trace.candidates.iter_mut().find(|t| t.id == c.record.id) {
+                        t.few_shot_reject = Some(RejectReason::TruncatedFromFewShot);
+                    }
+                    None
+                }
+            })
+            .collect();
         if examples.is_empty() {
-            return Ok(Outcome::Miss { reason: MissReason::NoCandidates });
+            trace.miss(MissReason::NoCandidates);
+            return Ok((Outcome::Miss { reason: MissReason::NoCandidates }, trace));
         }
-        Ok(Outcome::FewShot { examples })
+        for example in &examples {
+            if let Some(t) = trace.candidates.iter_mut().find(|t| t.id == example.id) {
+                t.selected = Some(PathTaken::FewShot);
+            }
+        }
+        trace.path = Some(PathTaken::FewShot);
+        Ok((Outcome::FewShot { examples }, trace))
     }
 
     pub async fn repairs(&self, scope: &Scope, err: &ErrorQuery) -> Result<Vec<RepairRecord>> {
@@ -115,6 +197,10 @@ where
                 None => RecordAskResult::SkippedBelowThreshold,
             });
         }
+        // Phase 4y.10: replaying an existing verified memory must not create a duplicate row.
+        if ask.path_taken == PathTaken::VerifiedReuse {
+            return Ok(RecordAskResult::SkippedVerifiedReuse);
+        }
 
         let sql_has_absolute_dates = sql_has_absolute_dates(&ask.sql);
         // Re-embed only when the question changed; trust is preserved by store upsert.
@@ -129,6 +215,36 @@ where
                 self.embedder.embed(&ask.question).await?
             };
         let ts = now_ms();
+        let mut ask_signature = ask.ask_signature;
+        ask_signature.normalize();
+        // Phase 4y.4: key stored rows by tables actually referenced in the final SQL,
+        // and keep only schema fingerprints for those tables.
+        let tables = filter_tables_to_sql(&ask.tables, &ask.sql);
+        let schema_fingerprints: Vec<_> = ask
+            .schema_fingerprints
+            .into_iter()
+            .filter(|(t, _)| tables.iter().any(|kept| kept == t))
+            .collect();
+        // Phase 4y.10: deduplicate by normalized SQL hash + tables + signature beyond eval_id upsert.
+        // Never discard an expert row over a non-expert row, or a reuse-eligible row over a few-shot-only row.
+        let new_sql_hash = normalized_sql_hash(&ask.sql);
+        let new_reuse_eligible = self.policy.is_reuse_score_eligible(ask.expert, &ask.scores);
+        let near = self
+            .store
+            .list_eligible_asks_near(scope, &embedding, 16, Some(&tables), Some(&ask.kpis))
+            .await?;
+        if let Some(dup) = near.iter().find(|existing| {
+            let existing_reuse_eligible =
+                self.policy.is_reuse_score_eligible(existing.expert, &existing.scores);
+            existing.eval_id != ask.eval_id
+                && normalized_sql_hash(&existing.sql) == new_sql_hash
+                && existing.tables == tables
+                && ask_signature.matches(&existing.ask_signature)
+                && (!ask.expert || existing.expert)
+                && (!new_reuse_eligible || existing_reuse_eligible)
+        }) {
+            return Ok(RecordAskResult::Deduplicated { id: dup.id.clone() });
+        }
         let record = AskRecord {
             id: RecordId::new(),
             scope: scope.clone(),
@@ -136,10 +252,10 @@ where
             conversation_id: ask.conversation_id,
             question: ask.question,
             embedding,
-            tables: ask.tables,
+            tables,
             kpis: ask.kpis,
-            ask_signature: ask.ask_signature,
-            schema_fingerprints: ask.schema_fingerprints,
+            ask_signature,
+            schema_fingerprints,
             sql: ask.sql,
             sql_has_absolute_dates,
             pandas: ask.pandas,

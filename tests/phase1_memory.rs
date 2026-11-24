@@ -44,6 +44,7 @@ fn signature_window(months: &str) -> AskSignature {
         window: Some(format!("last {months} months")),
         filters: Default::default(),
         top_n: None,
+        ..Default::default()
     }
 }
 
@@ -300,7 +301,13 @@ async fn feedback_up_raises_few_shot_ranking() {
 
     let q = "monthly revenue by region last 6 months";
     let low = store(&mem, graded("low", q, "6", RELATIVE_SQL, "schema-v1")).await;
-    let mut high_score = graded("high", q, "6", RELATIVE_SQL, "schema-v1");
+    let mut high_score = graded(
+        "high",
+        q,
+        "6",
+        &format!("{RELATIVE_SQL} ORDER BY 1"),
+        "schema-v1",
+    );
     high_score.scores.final_score = Some(99.0);
     store(&mem, high_score).await;
 
@@ -502,7 +509,11 @@ async fn expert_lower_sim_does_not_block_higher_sim_reuse() {
     let mut expert = graded("expert", q_expert, "6", RELATIVE_SQL, "schema-v1");
     expert.expert = true;
     store(&mem, expert).await;
-    store(&mem, graded("normal", q_exact, "6", RELATIVE_SQL, "schema-v1")).await;
+    store(
+        &mem,
+        graded("normal", q_exact, "6", &format!("{RELATIVE_SQL} ORDER BY 1"), "schema-v1"),
+    )
+    .await;
 
     let out = mem.retrieve(&scope_a(), &query(q_exact, "6", "schema-v1")).await.unwrap();
     match out {

@@ -191,8 +191,8 @@ impl MemoryStore for InMemoryStore {
     ) -> Result<Vec<AskRecord>> {
         let mut rows = self.list_eligible_asks(scope).await?;
         if let Some(t) = tables {
-            let want = sorted_tables(t);
-            rows.retain(|r| same_sorted_strs(&sorted_tables(&r.tables), &want));
+            // Non-empty table overlap for few-shot; reuse checks subset in policy (4y.5).
+            rows.retain(|r| r.tables.iter().any(|rt| t.iter().any(|qt| qt == rt)));
         }
         if let Some(k) = kpis {
             let want = sorted_kpis(k);
